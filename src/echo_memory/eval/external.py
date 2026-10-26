@@ -74,8 +74,10 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from echo_memory.ingestion.write_episode import write_episode
-from echo_memory.retrieval.query_memory import query_memory
+# Re-exported, not reimplemented: the integration tests catch
+# external.WriteRefused and the CLI reports it, while the raise itself belongs
+# with the write it guards.
+from echo_memory.eval.backends.echo import WriteRefused  # noqa: F401
 
 KS = (1, 5, 10, 20, 30)
 
@@ -389,11 +391,28 @@ def content_words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS}
 
 
-def score_question(question: Question, returned: list[dict], sessions: dict[str, str]) -> dict:
+def score_question(
+    question: Question, returned: list[dict], sessions: dict[str, str],
+    *, attributed: bool = True,
+) -> dict:
     """One row of results for one question, from what retrieval returned.
 
-    `returned` is query_memory's fact list in rank order. The turn a fact came
+    `returned` is a backend's result list in rank order. The turn a fact came
     from is read out of its provenance, which is where ingest put it.
+
+    `attributed=False` for a backend that cannot say which turn a result came
+    from, which is every system that stores something a model DERIVED from the
+    turns rather than the turns themselves. The turn-keyed metrics are then
+    recorded as None, not 0.0.
+
+    That distinction is the whole reason this parameter exists. Scoring an
+    unanswerable attribution as a miss would report 0.0 for a competitor that
+    retrieved exactly the right content and merely could not name its source
+    turn - understating it, in our favour, in the one direction a reader of our
+    own benchmark has most reason to suspect. None is not a worse number; it is
+    the absence of one, and `means` drops it rather than averaging it in.
+    `answer_words@k` is computed from the returned TEXT and stays comparable
+    across every backend.
     """
     keys = [(f.get("provenance") or {}).get("project") or "" for f in returned]
     text = " ".join(f.get("fact") or "" for f in returned)
@@ -402,12 +421,21 @@ def score_question(question: Question, returned: list[dict], sessions: dict[str,
     row: dict = {
         "question_id": question.question_id,
         "category": question.category,
-        "rr": 1 / first if first else 0.0,
+        "rr": (1 / first if first else 0.0) if attributed else None,
         "answer_scoreable": len(wanted) >= ANSWER_MIN_WORDS,
+        "attributed": attributed,
     }
     for k in KS:
         top = keys[:k]
         found = set(top) & question.gold_turns
+        if not attributed:
+            row[f"recall@{k}"] = None
+            row[f"hit@{k}"] = None
+            row[f"session@{k}"] = None
+            if row["answer_scoreable"]:
+                words = content_words(" ".join(f.get("fact") or "" for f in returned[:k]))
+                row[f"answer_words@{k}"] = len(wanted & words) / len(wanted)
+            continue
         row[f"recall@{k}"] = len(found) / len(question.gold_turns) if question.gold_turns else 0.0
         row[f"hit@{k}"] = 1.0 if found else 0.0
         # Looked up, never re-derived from the key: the datasets spell the
@@ -424,6 +452,16 @@ def score_question(question: Question, returned: list[dict], sessions: dict[str,
             row[f"answer_words@{k}"] = len(wanted & words) / len(wanted)
     row["returned"] = len(returned)
     row["chars"] = len(text)
+    # How much of what came back could be scored at all. Attribution is not
+    # all-or-nothing per BACKEND, only per result: Mem0 carries a turn key
+    # through extraction for a memory derived from one turn, and cannot for one
+    # it synthesised from several - it has `replaced_by` and `synthesized`
+    # fields for exactly that case. A system whose answers are half
+    # unattributable has half its recall silently scored as a miss, so the
+    # share is reported rather than left for a reader to assume it was 1.0.
+    row["attribution_rate"] = (
+        sum(1 for key in keys if key) / len(keys) if keys else None
+    )
     return row
 
 
@@ -457,11 +495,15 @@ def foreign_facts(conn, prefix: str) -> int:
     return row[0] if row else 0
 
 
-class WriteRefused(RuntimeError):
-    """A turn the store would not take. Never swallowed: a benchmark that
-    quietly drops the turns it finds awkward is measuring a corpus nobody
-    has, and in LongMemEval the refused ones are the long turns, which are
-    disproportionately the ones carrying an answer."""
+# The one implementation of both lives in the Echo Memory backend now. These
+# are re-exported rather than reimplemented: a second copy of the ingest
+# contract is a copy that goes out of sync, and the assume-new assertions in it
+# are the kind of subtlety that was already found the hard way twice (see
+# EchoBackend.ingest).
+def _echo(conn, embedder, agent_id: str = "external-benchmark"):
+    from echo_memory.eval.backends.echo import EchoBackend
+
+    return EchoBackend(conn, embedder, agent_id=agent_id)
 
 
 def ingest(
@@ -471,48 +513,8 @@ def ingest(
     agent_id: str = "external-benchmark",
     progress: Callable[[str], None] | None = None,
 ) -> int:
-    """One fact per turn, keyed so scoring can find it again.
-
-    Both entity mentions are asserted as new, and both assertions are load
-    bearing. Without the utterance one the turns supersede each other: a fact
-    is an edge keyed by (source, target, relation_type), so
-    `speaker --said--> session` writes one fact per session, and 419 turns
-    became 18. Without the speaker one, two names that embed near each other
-    are flagged ambiguous and every fact touching the second is DEFERRED rather
-    than written, with nothing raised - Tim and John in LoCoMo's conv-43, which
-    cost 344 of 680 turns and looked like a successful ingest. An exact name
-    match still overrides the assertion, so a speaker's second turn resolves
-    onto the node their first one made.
-    """
-    written = 0
-    started = time.time()
-    for turn in instance.turns:
-        result = write_episode(
-            conn, instance.group_id, turn.session,
-            [{"name": turn.speaker, "type": "speaker"},
-             {"name": turn.node, "type": "utterance"}],
-            [{"source": turn.speaker, "target": turn.node, "relation_type": "said",
-              "fact": turn.fact, "confidence": "extracted"}],
-            {turn.node: {"resolved_to": "new"}, turn.speaker: {"resolved_to": "new"}},
-            embedder,
-            project=turn.key,
-            agent_id=agent_id,
-        )
-        if not result.get("edges_created"):
-            raise WriteRefused(
-                f"write refused for {turn.node} in {instance.group_id}: "
-                f"{result.get('error') or result}"
-            )
-        written += 1
-        # Reported during ingest rather than only after it, because a long run
-        # is hours of silence otherwise, and the rate is the number that says
-        # whether it is still worth waiting for: write throughput decays as the
-        # database grows (29ms to 129ms across 1,057 to 24,054 nodes, see
-        # docs/BENCHMARKS.md), so a run can slow to a stop without erroring.
-        if progress and written % 500 == 0:
-            rate = written / max(time.time() - started, 1e-9)
-            progress(f"  {instance.group_id}: {written:,} turns written, {rate:.0f}/s")
-    return written
+    """Echo Memory's ingest. See EchoBackend.ingest, which is this."""
+    return _echo(conn, embedder, agent_id).ingest(instance, progress=progress)
 
 
 @dataclass
@@ -522,6 +524,13 @@ class Run:
     dataset: str
     path: str
     top_k: int
+    #: Which system produced these numbers. A results file that does not say is
+    #: useless the moment there is more than one.
+    backend: str = "echo-mem"
+    #: Whether a result could be traced to its source turn. False means the
+    #: turn-keyed metrics in `rows` are null rather than zero; see
+    #: ATTRIBUTION_UNAVAILABLE.
+    attributed: bool = True
     rows: list[dict] = field(default_factory=list)
     instances: int = 0
     turns_written: int = 0
@@ -547,11 +556,10 @@ def fingerprint(path: str) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def run(
-    conn,
+def run_backend(
+    backend,
     dataset: str,
     path: str,
-    embedder,
     *,
     limit: int = 0,
     per_type: int = 0,
@@ -559,27 +567,41 @@ def run(
     results_path: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> Run:
-    """Ingest and score one instance at a time.
+    """Ingest and score one instance at a time, against any backend.
 
     Not two passes. Each instance is a self-contained haystack, so nothing is
     lost by finishing with it before reading the next, and two things are
     gained: peak memory is one haystack, and a run that dies at hour three has
-    scored everything it ingested instead of nothing.
+    scored everything it ingested instead of nothing. That mattered for one
+    system and matters more for four, since a LongMemEval run against a hosted
+    competitor is both slow and billed.
+
+    `backend.check()` runs BEFORE anything is ingested. A four system run that
+    dies on the fourth because its key was never set has wasted the first
+    three, and with Mem0 and Zep calling a model per write, wasted them
+    expensively.
     """
     load = DATASETS[dataset]
     size, digest = fingerprint(path)
+    backend.check()
+    attributed = bool(getattr(backend, "attributes_results", True))
     out = Run(dataset=dataset, path=path, top_k=top_k,
-              dataset_bytes=size, dataset_sha256=digest)
+              dataset_bytes=size, dataset_sha256=digest,
+              backend=getattr(backend, "name", "unknown"),
+              attributed=attributed)
     started = time.time()
     for instance in load(path, limit=limit, per_type=per_type):
-        if already_ingested(conn, instance.group_id, len(instance.turns)):
+        if backend.already_ingested(instance.group_id, len(instance.turns)):
             out.scopes_resumed += 1
         else:
-            out.turns_written += ingest(conn, instance, embedder, progress=progress)
+            out.turns_written += backend.ingest(instance, progress=progress)
+            # Before the first question, not after the last instance. An async
+            # backend has queued work and querying now scores an empty store.
+            backend.settle(instance.group_id, len(instance.turns), progress)
         sessions = instance.sessions
         for question in instance.questions:
-            found = query_memory(conn, instance.group_id, question.question, top_k, embedder)
-            row = score_question(question, found.get("facts", []), sessions)
+            found = backend.query(instance.group_id, question.question, top_k)
+            row = score_question(question, found, sessions, attributed=attributed)
             out.rows.append(row)
             if results_path:
                 # Appended as it happens, so a killed run keeps what it scored.
@@ -594,6 +616,33 @@ def run(
     out.seconds = time.time() - started
     return out
 
+
+def run(
+    conn,
+    dataset: str,
+    path: str,
+    embedder,
+    **kwargs,
+) -> Run:
+    """Echo Memory against a dataset. The signature every existing caller uses.
+
+    Kept because the CLI and the integration tests call it, and because "run
+    the benchmark" meaning "run it against this project" is the right default.
+    Pass a backend to `run_backend` for anything else.
+    """
+    from echo_memory.eval.backends.echo import EchoBackend
+
+    return run_backend(EchoBackend(conn, embedder), dataset, path, **kwargs)
+
+
+ATTRIBUTION_UNAVAILABLE = (
+    "this backend stores what a model derived from the turns rather than the "
+    "turns, so a result cannot be traced to the turn it came from. The "
+    "turn-keyed metrics (MRR, recall@k, hit@k, session@k) are not computable "
+    "and are null rather than zero: a zero would report it as having retrieved "
+    "nothing, when what is missing is the attribution, not the content. "
+    "answer_words@k is computed from the returned text and stays comparable."
+)
 
 ACCURACY_UNAVAILABLE = (
     "both benchmarks define accuracy as model-judged QA over what memory "
@@ -612,15 +661,35 @@ def means(rows: list[dict]) -> dict:
     if not rows:
         return {}
     scoreable = [r for r in rows if r["answer_scoreable"]]
-    out: dict = {"n": len(rows), "MRR": statistics.mean(r["rr"] for r in rows)}
+
+    def over(metric: str):
+        """The mean over rows that actually carry this metric, or None.
+
+        A backend that cannot attribute a result to a source turn records None
+        for the turn-keyed metrics rather than 0.0, so averaging has to drop
+        them. `statistics.mean` over a list holding None raises; silently
+        coercing to 0.0 would be the exact dishonesty that None exists to
+        avoid, by reporting a competitor as having retrieved nothing.
+        """
+        values = [r[metric] for r in rows if r.get(metric) is not None]
+        return statistics.mean(values) if values else None
+
+    out: dict = {"n": len(rows), "MRR": over("rr")}
+    # Said out loud rather than left to be inferred from a column of nulls.
+    out["attributed"] = all(r.get("attributed", True) for r in rows)
+    if not out["attributed"]:
+        out["attribution_unavailable"] = ATTRIBUTION_UNAVAILABLE
     for k in KS:
         for metric in ("recall", "hit", "session"):
-            out[f"{metric}@{k}"] = statistics.mean(r[f"{metric}@{k}"] for r in rows)
+            out[f"{metric}@{k}"] = over(f"{metric}@{k}")
     out["answer_scoreable"] = len(scoreable)
     if scoreable:
         for k in KS:
             out[f"answer_words@{k}"] = statistics.mean(r[f"answer_words@{k}"] for r in scoreable)
     out["mean_facts_returned"] = statistics.mean(r["returned"] for r in rows)
+    # Beside every turn-keyed number, so a low recall can be told apart from a
+    # recall that was never measurable.
+    out["attribution_rate"] = over("attribution_rate")
     # What the answer cost, beside whether it was right. A configuration that
     # finds everything by returning everything is not better, and this is the
     # number that says so; `eval` reports the same thing as tokens.
