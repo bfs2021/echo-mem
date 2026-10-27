@@ -4,7 +4,7 @@ skip."""
 
 from fake_embedder import REFERENCE, VectorEmbedder
 
-from echo_memory.audit.get_audit_log import get_audit_log
+from echo_memory.audit.get_audit_log import MAX_ENTRIES, get_audit_log
 from echo_memory.infra.db import connect
 from echo_memory.ingestion.write_episode import write_episode
 
@@ -130,7 +130,7 @@ def test_scoped_to_group_id(migrated_db):
 def test_empty_group_returns_empty_list_not_error(migrated_db):
     conn = connect(migrated_db)
     result = get_audit_log(conn, "nonexistent-group")
-    assert result == {"entries": []}
+    assert result == {"entries": [], "truncated": False}
 
 
 def test_validation_rejects_malformed_since(migrated_db):
@@ -162,3 +162,51 @@ def test_entries_from_one_episode_come_back_in_the_order_they_happened(migrated_
             )
             kinds = [e["mutation_type"] for e in get_audit_log(conn, group)["entries"]]
             assert kinds == ["created", "fact_superseded"], _json.dumps(kinds)
+
+
+def test_truncated_flag_true_at_the_cap_and_false_below(migrated_db):
+    conn = connect(migrated_db)
+    def write_one(n: int) -> None:
+        # entity names reach the embedder inside "<source> <target>. <fact>";
+        # register the fact text so the fallback in fake_embedder resolves it,
+        # and the name itself for the node embedding
+        embedder = VectorEmbedder({f"entry {n}": REFERENCE, f"tool-{n}": REFERENCE})
+        write_episode(
+            conn, "g-trunc", f"sess-{n}",
+            [{"name": f"tool-{n}", "type": "tool"}],
+            [{
+                "source": f"tool-{n}",
+                "target": f"tool-{n}",
+                "relation_type": "uses",
+                "fact": f"entry {n}",
+                "confidence": "extracted",
+            }],
+            # one episode = one created entry plus its entity_resolved entry,
+            # so count episodes from the audit log itself instead of assuming
+            {f"tool-{n}": {"resolved_to": "new"}},
+            embedder,
+            assume_new=True,
+        )
+
+    # Fill to exactly one entry under the cap and exactly at it, whatever an
+    # episode's exact audit footprint is: write one, measure, then add the
+    # remaining episodes one at a time until the count is right.
+    write_one(0)
+    after_one = len(get_audit_log(conn, "g-trunc")["entries"])
+    assert after_one < MAX_ENTRIES - 1, "one episode already reached the cap"
+
+    n = 1
+    while True:
+        result = get_audit_log(conn, "g-trunc")
+        count = len(result["entries"])
+        if count == MAX_ENTRIES - 1:
+            assert result["truncated"] is False
+            break
+        assert count < MAX_ENTRIES - 1, count
+        write_one(n)
+        n += 1
+
+    write_one(n + 1)
+    result = get_audit_log(conn, "g-trunc")
+    assert len(result["entries"]) == MAX_ENTRIES
+    assert result["truncated"] is True

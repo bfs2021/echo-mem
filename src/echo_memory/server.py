@@ -630,7 +630,8 @@ def record_recall_save(
 def get_audit_log(scope: str, since: str | None = None) -> dict:
     """Human-readable audit trail: what was written, invalidated, superseded,
     or resolved, and why. since is an ISO8601 timestamp; entries at or after
-    it, chronologically ordered."""
+    it, chronologically ordered. At most 500 entries; `truncated` in the
+    result says when the log went on past that, and since is how to page."""
     try:
         group_id = _state.config.group_id(scope)
     except ConfigError as e:

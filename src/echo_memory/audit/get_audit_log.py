@@ -63,6 +63,9 @@ def _row_to_entry(row) -> dict:
 
 
 def get_audit_log(conn, group_id: str, since: str | None = None) -> dict:
+    """At most MAX_ENTRIES entries; `truncated` says when the log went on
+    past that. Page forward with `since` (an ISO8601 lower bound; the
+    returned entries start at or after it)."""
     start = time.perf_counter()
     try:
         since_dt = _parse_since(since)
@@ -104,7 +107,7 @@ def get_audit_log(conn, group_id: str, since: str | None = None) -> dict:
             }
         },
     )
-    return {"entries": entries}
+    return {"entries": entries, "truncated": len(entries) == MAX_ENTRIES}
 
 
 def get_fact_history(conn, group_id: str, fact_id: str) -> dict:
