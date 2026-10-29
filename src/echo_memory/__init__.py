@@ -11,7 +11,12 @@ except PackageNotFoundError:  # a source checkout with nothing installed
 
 
 def _source_digest(package_dir: Path | None = None) -> str:
-    """A digest of this package's own files: the identity of the running code.
+    """A digest of this package's own files as they stand at import.
+
+    A snapshot of the source tree at startup, not an identity of every module
+    the process goes on to execute: a module imported after an edit runs the
+    new code while this digest keeps naming the tree as it stood at startup.
+    Dependencies and configuration are outside its scope.
 
     importlib.metadata reads the .dist-info the last `pip install` wrote, which
     never moves in an editable checkout - so a version read from it records the
@@ -31,9 +36,10 @@ def _source_digest(package_dir: Path | None = None) -> str:
 
 
 # The stamp audit_entry.writer_version carries: the install version for humans,
-# plus a digest of the code actually loaded, read once at import - the moment
-# the tree on disk is the code this process runs. A server spawned before an
-# upgrade writes its old identity; a later health run hashing the tree sees it.
+# plus a digest of this package's source tree as it stood at import. A module
+# imported after startup runs whatever the tree holds then; the stamp stays the
+# startup snapshot. A server spawned before an upgrade writes its old identity;
+# a later health run hashing the tree sees it.
 try:
     __writer_version__ = f"{__version__}+{_source_digest()}"
 except OSError:  # an unreadable source: say what the column said before

@@ -5,6 +5,8 @@ never moves in an editable checkout - the column recorded the installer, not
 the writer, and the health check compared the installer against itself.
 """
 
+from importlib import import_module
+
 from echo_memory import _source_digest
 
 
@@ -39,3 +41,30 @@ def test_an_edit_moves_the_digest(tmp_path):
     (pkg / "write_episode.py").write_text("y = 2\n")
 
     assert _source_digest(pkg) != before
+
+
+def test_a_late_import_after_an_edit_leaves_the_stamp_at_startup(tmp_path, monkeypatch):
+    """Boundary of the digest: it is a snapshot of the source tree at startup,
+    not an identity of every module subsequently executed. A module imported
+    after an edit runs the new code while the stamp keeps naming the tree as
+    it stood at startup. Dependencies and configuration are outside its scope.
+    """
+    pkg = tmp_path / "latepkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    late = pkg / "late.py"
+    late.write_text("VALUE = 1\n")
+
+    startup = tmp_path / "startup_snapshot"
+    startup.mkdir()
+    (startup / "__init__.py").write_text("")
+    (startup / "late.py").write_text("VALUE = 1\n")
+    stamp = _source_digest(startup)  # what the process records at import
+
+    late.write_text("VALUE = 2\n")  # the edit lands after startup
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = import_module("latepkg.late")
+
+    assert module.VALUE == 2  # the process runs the edited module...
+    assert _source_digest(pkg) != stamp  # ...which a fresh hash would notice...
+    assert stamp == _source_digest(startup)  # ...while the startup stamp holds
